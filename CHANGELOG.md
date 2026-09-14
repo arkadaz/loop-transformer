@@ -57,6 +57,10 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 - Decoder KV cache (per-layer self-attention keys/values, encoder cross-attention projections computed once). Exact: 32/32 greedy sequences identical to the uncached path; batch-32 generation 30x faster. On by default everywhere generation happens.
 - TurboQuant-style compression of the self-attention cache (`src/quant.py`): random rotation, Lloyd-Max codebooks at 1 to 4 bits, bit-packed codes, fp16 norms, 1-bit QJL residual for unbiased attention scores. 4-bit: 312 bytes per token per layer against 1024 for fp16, 94% next-token agreement, KL 0.011. `src/kv_bench.py` reproduces the table.
 
+### Documentation
+
+- README: quick start, repository layout, every stage's command, the foundation panel, the 128-prompt reward and variety table, the KV cache and TurboQuant tables, and the tried-and-rejected list. This file records the history. `src/instruct_eval.py` and `src/kv_bench.py` reproduce every table.
+
 ### Final checkpoints kept on disk (not in git)
 
 | File | Role |

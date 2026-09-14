@@ -11,15 +11,15 @@ uv sync
 uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-evolved-03.pt --max-new-tokens 160
 ```
 
-Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
+Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
 
 ## Repository layout
 
 | Path | Role |
 | --- | --- |
 | `main.py` | Dispatches `pretrain`, `anneal`, `sft`/`posttrain`, `evolve`. |
-| `play.py` | Interactive runner with sampling controls. |
-| `src/model.py` | The loop transformer: recurrent encoder, latent thoughts, decoder with prompt prefill, sampling helper. |
+| `play.py` | Interactive runner: sampling controls, effort level, KV-cache options. |
+| `src/model.py` | The loop transformer: recurrent encoder, latent thoughts, decoder with prompt prefill, KV cache, sampling helper. |
 | `src/pretrain.py` | Foundation trainer: streamed mixture loader, windowing, quality gate, anchor, rollout-guarded selection. |
 | `src/pretrain_distill.py` | Shared training loop, checkpoint save/load, the SFT stage with its foundation-retention guard. |
 | `src/data.py` | SFT data sources (TinyStoriesInstruct story prompts, continuation replay, GSM8K/ARC/CommonsenseQA/finance/Dolly) and the story verifier. |
@@ -27,8 +27,8 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | `src/evolution.py` | CEM over the latent-thought offset with the answer reward and the rule-verified story reward. |
 | `src/quant.py` | TurboQuant KV-cache compression: random rotation, Lloyd-Max codebooks, 1-bit QJL residual, bit-packed storage. |
 | `src/kv_bench.py` | KV-cache report: exactness, speed-up, fidelity per bit width, bytes per token. |
-| `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints. |
-| `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (produces the table below). |
+| `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints (`--kv-bits` supported). |
+| `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (`--kv-bits` supported; produces the table below). |
 | `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
 | `configs/tinystories_foundation.json` | The pinned foundation corpus. |
 | `tests/` | 93 tests; `uv run python -m pytest -q`. |
@@ -42,6 +42,7 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | Decoder | Six causal blocks that cross-attend to the final encoder state. The last 24 prompt tokens are also copied into the decoder (`--decoder-prompt-prefill-tokens 24`) so the first generated word does not depend on cross-attention alone. |
 | Parameters | 10,015,296, tied embedding and LM head. |
 | Context | Architecture limit 512 tokens. Trained on 128 input + 160 target tokens; `play.py` truncates longer prompts to the trained limit. |
+| Generation | Sampling (temperature, top-p, repeated-n-gram block) and an exact per-layer KV cache; `--kv-bits 1..4` compresses the cache with TurboQuant. See [KV cache and TurboQuant](#kv-cache-and-turboquant). |
 
 `/effort low`, `medium`, and `high` run 1, 3, and 6 encoder loops. Loops never stop early; there is no halting head. Generation stops at EOS or the token limit.
 

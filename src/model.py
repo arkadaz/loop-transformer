@@ -1,4 +1,4 @@
-"""Text-only recurrent encoder-decoder student model."""
+"""Text-only recurrent encoder-decoder student model with an exact, optionally TurboQuant-compressed decoder KV cache."""
 from __future__ import annotations
 
 import math
