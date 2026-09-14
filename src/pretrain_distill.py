@@ -354,6 +354,7 @@ def train(
     checkpoint_every_steps: int = 0,
     on_checkpoint: Callable[[LoopTransformer, list[dict[str, float]], dict[str, Any]], None] | None = None,
     thinking_efforts: Sequence[str] = ("low", "medium", "high"),
+    loop_range: tuple[int, int] | None = None,
     warmup_steps: int = 0,
     min_lr_ratio: float = 1.0,
     resume_training_state: dict[str, Any] | None = None,
@@ -380,6 +381,9 @@ def train(
         raise ValueError("Training and validation examples must both be non-empty.")
     if not thinking_efforts or any(effort not in {"low", "medium", "high"} for effort in thinking_efforts):
         raise ValueError("thinking_efforts must contain one or more of: low, medium, high.")
+    if loop_range is not None and not 1 <= loop_range[0] <= loop_range[1] <= model.config.max_loop_steps:
+        raise ValueError(f"loop_range must satisfy 1 <= lo <= hi <= {model.config.max_loop_steps}.")
+    loop_rng = random.Random(seed + 7)  # variable-depth training: one random loop count per step
     if warmup_steps < 0 or not 0 < min_lr_ratio <= 1:
         raise ValueError("warmup_steps must be non-negative and min_lr_ratio must be in (0, 1].")
     if prefix_loss_weight < 1 or prefix_loss_tokens < 0:
@@ -471,6 +475,7 @@ def train(
                     input_attention_mask=batch["input_mask"],
                     target_attention_mask=batch["target_mask"],
                     thinking_effort=thinking_effort,
+                    num_loops=loop_rng.randint(*loop_range) if loop_range else None,
                 )
                 loss, count, objective_weight = _loss(
                     logits,
@@ -783,6 +788,7 @@ def run(args) -> None:
         seed=args.seed,
         selection_callback=foundation_selector,
         thinking_efforts=(args.thinking_effort,),  # match the foundation's loop count
+        loop_range=tuple(args.loop_range) if args.loop_range else None,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
     )
@@ -822,6 +828,7 @@ def main() -> None:
     parser.add_argument("--allow-ungated", action="store_true", help="Run SFT on a base that failed the foundation gate.")
     parser.add_argument("--max-foundation-regression", type=float, help="Override the stored foundation-loss regression limit.")
     parser.add_argument("--thinking-effort", choices=("low", "medium", "high"), default="high", help="Encoder loops used in SFT; keep the foundation setting.")
+    parser.add_argument("--loop-range", type=int, nargs=2, metavar=("LO", "HI"), help="Random encoder loop count per step in [LO, HI]; makes representations depth-consistent.")
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     args = parser.parse_args()

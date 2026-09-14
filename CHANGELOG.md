@@ -57,6 +57,12 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 - Decoder KV cache (per-layer self-attention keys/values, encoder cross-attention projections computed once). Exact: 32/32 greedy sequences identical to the uncached path; batch-32 generation 30x faster. On by default everywhere generation happens.
 - TurboQuant-style compression of the self-attention cache (`src/quant.py`): random rotation, Lloyd-Max codebooks at 1 to 4 bits, bit-packed codes, fp16 norms, 1-bit QJL residual for unbiased attention scores. 4-bit: 312 bytes per token per layer against 1024 for fp16, 94% next-token agreement, KL 0.011. `src/kv_bench.py` reproduces the table.
 
+### Adaptive depth
+
+- Measured reward vs loop count: the fixed-depth SFT model peaks at 3 loops (0.495), not the 6 it trained at (0.410), and collapses at 8+. Its encoder state never converges, so convergence halting runs to the cap and hurts.
+- Added `--loop-range LO HI` (random loop count per training step) and per-row convergence halting (`halt_threshold`, `/effort auto`). A foundation pass with loops in 1..8 gives identical held-out loss at every depth (1.500, vs 1.538 best for the fixed model) and a fixed point after one loop. SFT on it (`story-sft-depth-01`) is flat from 1 to 8 loops (0.44 to 0.46) and stops itself at 2 loops at no cost. Conclusion: robustness and self-stopping, not more intelligence, on this task.
+- `play.py` defaults to `medium` (3 loops).
+
 ### Documentation
 
 - README: quick start, repository layout, every stage's command, the foundation panel, the 128-prompt reward and variety table, the KV cache and TurboQuant tables, and the tried-and-rejected list. This file records the history. `src/instruct_eval.py` and `src/kv_bench.py` reproduce every table.
@@ -67,5 +73,6 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 | --- | --- |
 | `loop-transformer-10m-tinystories-prefill-long-02.pt` | foundation base |
 | `loop-transformer-10m-story-sft-05.pt` | SFT, the checkpoint to build on |
-| `loop-transformer-10m-story-evolved-03.pt` | SFT plus evolved latent offset, the one to play with |
+| `loop-transformer-10m-story-evolved-03.pt` | SFT plus evolved latent offset, the one to play with (use `/effort medium`) |
+| `loop-transformer-10m-tinystories-depth-01.pt`, `loop-transformer-10m-story-sft-depth-01.pt` | variable-depth base and its SFT; the ones that can stop themselves (`/effort auto`) |
 | `prefill-01`, `long-01`, `story-sft-04`, `story-sft-06`, `story-evolved-01` | comparison points in the README tables |

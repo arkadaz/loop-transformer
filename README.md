@@ -11,7 +11,7 @@ uv sync
 uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-evolved-03.pt --max-new-tokens 160
 ```
 
-Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
+Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. `/effort auto` is meant for checkpoints trained with `--loop-range` (`story-sft-depth-01.pt`). Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
 
 ## Repository layout
 
@@ -31,7 +31,7 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (`--kv-bits` supported; produces the table below). |
 | `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
 | `configs/tinystories_foundation.json` | The pinned foundation corpus. |
-| `tests/` | 93 tests; `uv run python -m pytest -q`. |
+| `tests/` | 95 tests; `uv run python -m pytest -q`. |
 
 ## What the model is
 
@@ -44,7 +44,7 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | Context | Architecture limit 512 tokens. Trained on 128 input + 160 target tokens; `play.py` truncates longer prompts to the trained limit. |
 | Generation | Sampling (temperature, top-p, repeated-n-gram block) and an exact per-layer KV cache; `--kv-bits 1..4` compresses the cache with TurboQuant. See [KV cache and TurboQuant](#kv-cache-and-turboquant). |
 
-`/effort low`, `medium`, and `high` run 1, 3, and 6 encoder loops. Loops never stop early; there is no halting head. Generation stops at EOS or the token limit.
+`/effort low`, `medium`, and `high` run 1, 3, and 6 encoder loops; `/effort auto` lets each prompt stop looping once its encoder state stops changing (see [Adaptive depth](#adaptive-depth)). Generation stops at EOS or the token limit.
 
 ## Stage 1: foundation on TinyStories
 
@@ -188,6 +188,45 @@ Verifier reward of `story-evolved-03` on the 128-prompt panel (greedy) with the 
 Honest framing: this model's whole cache is a few hundred kilobytes, so compression buys nothing in practice here. The implementation is the point: it is the mechanism a long-context version would need, measured end to end.
 
 What this does not do: the model still uses learned absolute positions up to 512 tokens and materialised attention. Long context needs RoPE plus a context curriculum and retraining; a KV cache does not extend the trained length.
+
+## Adaptive depth
+
+A loop transformer should decide how many loops a prompt needs. Two things were measured first on `story-sft-05`, which was trained at a fixed 6 loops: the encoder state keeps changing at every loop (relative change 0.50, 0.20, 0.19, 0.17 ... 0.05 at loop 12), and quality is a sharp function of the loop count with its peak *below* the trained depth. So a convergence rule could not stop it, and the fixed depth was not even its best operating point.
+
+`--loop-range LO HI` (on `pretrain` and `sft`) draws a random loop count per training step, which forces depth-consistent representations. `halt_threshold` in `encode`/`generate` (`/effort auto` in `play.py`, `--halt-thresholds` in `instruct_eval`) then stops each prompt row once its mean relative state change drops below the threshold, up to a cap; other rows keep looping. No new parameters.
+
+```powershell
+# foundation pass with random depth 1..8, from long-02 (the rollout guard at 6 loops rejected the trained weights; they are in the *.partial.pt, promoted here to depth-01.pt)
+uv run python main.py pretrain --init-checkpoint checkpoints/loop-transformer-10m-tinystories-prefill-long-02.pt --output checkpoints/loop-transformer-10m-tinystories-depth-01.pt --mixture-config configs/tinystories_foundation.json --streaming --streaming-train-skip-documents 400000 --max-documents 800000 --max-validation-documents 10000 --max-examples 750000 --max-validation-examples 5000 --decoder-prompt-prefill-tokens 24 --max-input-tokens 128 --max-target-tokens 160 --train-initial-prefix-span 32 --batch-size 32 --epochs 1 --lr 1.5e-4 --warmup-steps 500 --min-lr-ratio 0.1 --prefix-loss-weight 1 --prefix-loss-tokens 0 --foundation-eval-examples 64 --rollout-tokens 128 --selection-strategy validation --save-every-steps 2000 --loop-range 1 8 --seed 131 --device cuda
+# SFT with the same range
+uv run python main.py sft --init-checkpoint checkpoints/loop-transformer-10m-tinystories-depth-01.pt --output checkpoints/loop-transformer-10m-story-sft-depth-01.pt --datasets tinystories_instruct,tinystories_continue --per-source 12000 --validation-fraction 0.05 --epochs 3 --lr 2e-5 --warmup-steps 100 --min-lr-ratio 0.1 --batch-size 16 --max-input-tokens 128 --max-target-tokens 256 --teacher-tokens 220 --teacher-temperature 0.7 --teacher-batch-size 16 --allow-ungated --max-foundation-regression 0.25 --thinking-effort high --loop-range 1 8 --seed 42 --device cuda
+# the table below
+uv run python -m src.instruct_eval checkpoints/loop-transformer-10m-story-sft-05.pt checkpoints/loop-transformer-10m-story-sft-depth-01.pt --prompts 128 --loops 1,2,3,4,6,8,12 --halt-thresholds 0.2,0.1,0.05 --max-loops 12
+```
+
+Foundation held-out continuation loss (256 validation stories) by loop count: `long-02` (fixed 6) 1.746, 1.597, 1.563, 1.548, **1.538**, 1.541, 1.554 at k = 1, 2, 3, 4, 6, 8, 12; `depth-01` (random 1..8) **1.500 at every k**. Its state change after loop 1 is 0.02 to 0.05: freed from a fixed depth, it reaches a fixed point after one loop, because TinyStories continuation needs no iterative computation.
+
+Verifier reward on the 128 instruction prompts, greedy:
+
+| Setting | `story-sft-05` (fixed 6) | `story-sft-depth-01` (random 1..8) |
+| --- | --- | --- |
+| 1 loop | 0.401 | 0.439 |
+| 2 loops | 0.435 | 0.447 |
+| 3 loops | **0.495** | 0.442 |
+| 4 loops | 0.479 | 0.459 |
+| 6 loops (old default) | 0.410 | **0.460** |
+| 8 loops | 0.321 | 0.457 |
+| 12 loops | 0.299 | 0.409 |
+| auto, halt < 0.2 | 0.341 (7.2 loops used) | 0.447 (2.0 loops used) |
+| auto, halt < 0.1 | 0.304 (11.6 loops) | 0.438 (2.0 loops) |
+| auto, halt < 0.05 | 0.299 (12 loops) | 0.454 (7.0 loops) |
+
+What it means:
+
+- **Variable-depth training buys robustness and self-stopping, not more intelligence.** The depth-trained model scores the same from 1 to 8 loops and stops itself after 2 loops at no cost (0.447 vs 0.460), a 3x saving in encoder compute. It does not get better with more loops: this task has nothing for the recurrence to iterate on.
+- **The fixed-depth model was mis-operated.** Its best operating point is 3 loops (0.495), not the 6 it trained at (0.410). `play.py` now defaults to `medium`. Any halting rule is useless on it because its state never converges.
+- **Beyond the trained range, both degrade** (12 loops), so the halting cap should stay inside it.
+- A learned halting head (PonderNet or ACT with a ponder cost) is only worth adding for a task where more loops demonstrably help; on this data they do not.
 
 ## Scope
 

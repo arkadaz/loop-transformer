@@ -1323,6 +1323,7 @@ def run(args) -> None:
         checkpoint_every_steps=args.save_every_steps,
         on_checkpoint=checkpoint_progress,
         thinking_efforts=(args.thinking_effort,),
+        loop_range=tuple(args.loop_range) if args.loop_range else None,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
         resume_training_state=resume_training_state,
@@ -1618,6 +1619,7 @@ def main(stage: str = "pretrain") -> None:
         help="Maximum allowed loss increase on the fixed foundation set during annealing.",
     )
     parser.add_argument("--thinking-effort", choices=("low", "medium", "high"), default="high")
+    parser.add_argument("--loop-range", type=int, nargs=2, metavar=("LO", "HI"), help="Random encoder loop count per step in [LO, HI]; makes representations depth-consistent.")
     parser.add_argument("--init-checkpoint")
     if not is_anneal:
         parser.add_argument(

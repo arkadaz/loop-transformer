@@ -267,7 +267,10 @@ class LoopTransformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         num_loops: int | None = None,
         return_loop_history: bool = False,
+        halt_threshold: float | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """With ``halt_threshold`` each row stops looping once its mean relative state change falls below
+        it (``num_loops`` is then the cap); the loops actually run per row are left in ``self.loops_used``."""
         loops = self.resolve_loops(num_loops=num_loops)
         mask = self._encoder_mask(input_ids, attention_mask)
         thoughts = self.latent_thoughts
@@ -279,10 +282,23 @@ class LoopTransformer(nn.Module):
         hidden = torch.cat([thoughts.expand(input_ids.shape[0], -1, -1), self._embed(input_ids)], dim=1)
         hidden = hidden * mask.unsqueeze(-1).to(hidden.dtype)
         history = [hidden.detach().clone()] if return_loop_history else None
+        valid = mask.unsqueeze(-1).to(hidden.dtype)
+        done = torch.zeros(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+        self.loops_used = torch.full((hidden.shape[0],), loops, device=hidden.device) if halt_threshold is not None else None
         for loop_index in range(loops):
-            hidden = self.encoder(hidden, loop_index, mask) * mask.unsqueeze(-1).to(hidden.dtype)
+            updated = self.encoder(hidden, loop_index, mask) * valid
+            if halt_threshold is None:
+                hidden = updated
+            else:  # adaptive depth: freeze rows whose state has stopped changing
+                change = ((updated - hidden).norm(dim=-1) / updated.norm(dim=-1).clamp_min(1e-6) * mask).sum(1) / mask.sum(1)
+                hidden = torch.where(done[:, None, None], hidden, updated)
+                newly = ~done & (change < halt_threshold)
+                self.loops_used[newly] = loop_index + 1
+                done |= newly
             if history is not None:
                 history.append(hidden.detach().clone())
+            if done.all():
+                break
         return self.encoder_norm(hidden), history
 
     def decode(
@@ -402,6 +418,7 @@ class LoopTransformer(nn.Module):
         eos_token_id: int | None = None,
         use_cache: bool = True,
         kv_bits: int = 0,
+        halt_threshold: float | None = None,
     ) -> torch.Tensor:
         """``use_cache`` reproduces the uncached outputs exactly; ``kv_bits`` in 1..4 TurboQuant-compresses the
         self-attention cache (0 keeps it in full precision). The last cache is kept on ``self.kv_cache``."""
@@ -423,7 +440,7 @@ class LoopTransformer(nn.Module):
             raise ValueError("Prompt prefill plus max_new_tokens exceeds max_seq_len.")
 
         encoder_mask = self._encoder_mask(input_ids, input_attention_mask)
-        encoder_hidden, _ = self.encode(input_ids, attention_mask=input_attention_mask, num_loops=loops)
+        encoder_hidden, _ = self.encode(input_ids, attention_mask=input_attention_mask, num_loops=loops, halt_threshold=halt_threshold)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         returned = visible_start
         quantizer = TurboQuant(self.config.d_model // self.config.n_heads, kv_bits, kv_bits, device=input_ids.device) if kv_bits else None

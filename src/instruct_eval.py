@@ -17,14 +17,16 @@ from src.pretrain_distill import load_checkpoint, split_examples
 @torch.inference_mode()
 def score(model, tokenizer, prompts, *, device: str, max_new_tokens: int, **decoding) -> dict[str, float]:
     torch.manual_seed(0)
-    rewards, words, all_three, dialogue, ended, openings, lily = [], 0.0, 0, 0, 0, set(), 0
+    rewards, words, all_three, dialogue, ended, openings, lily, loops = [], 0.0, 0, 0, 0, set(), 0, []
     for start in range(0, len(prompts), 32):
         batch = prompts[start : start + 32]
         ids = [tokenizer.encode(e["prompt"], add_special_tokens=False)[:128] for e in batch]
         width = max(map(len, ids))
         x = torch.tensor([i + [tokenizer.pad_token_id] * (width - len(i)) for i in ids], device=device)
         mask = torch.tensor([[1] * len(i) + [0] * (width - len(i)) for i in ids], device=device)
-        out = model.generate(x, input_attention_mask=mask, thinking_effort="high", max_new_tokens=max_new_tokens, **decoding)
+        out = model.generate(x, input_attention_mask=mask, max_new_tokens=max_new_tokens, **{"thinking_effort": "high", **decoding})
+        if getattr(model, "loops_used", None) is not None:
+            loops.extend(model.loops_used.tolist())
         for example, row in zip(batch, out):
             tokens = row[1:].tolist()
             done = tokenizer.eos_token_id in tokens
@@ -38,7 +40,8 @@ def score(model, tokenizer, prompts, *, device: str, max_new_tokens: int, **deco
             openings.add(" ".join(text.split()[:4]).lower())
             lily += "lily" in text.lower()
     n = len(prompts)
-    return {"reward": sum(rewards) / n, "words": words / n, "all3": all_three, "dialogue": dialogue, "ended": ended, "openings": len(openings), "lily": lily}
+    return {"reward": sum(rewards) / n, "words": words / n, "all3": all_three, "dialogue": dialogue, "ended": ended, "openings": len(openings), "lily": lily,
+            "loops": sum(loops) / len(loops) if loops else None}
 
 
 def main() -> None:
@@ -49,6 +52,9 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--seed", type=int, default=7, help="Must match the evolve run's --seed for the same split.")
     parser.add_argument("--kv-bits", type=int, default=0, choices=(0, 1, 2, 3, 4), help="TurboQuant bits for the KV cache; 0 = exact.")
+    parser.add_argument("--loops", default="", help="Comma-separated fixed loop counts to evaluate instead of high (6).")
+    parser.add_argument("--halt-thresholds", default="", help="Comma-separated convergence thresholds for adaptive depth (cap --max-loops).")
+    parser.add_argument("--max-loops", type=int, default=12)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     raw = load_examples(("tinystories_instruct_valid",), per_source=800, seed=args.seed)
@@ -57,7 +63,11 @@ def main() -> None:
     decodings = [("greedy", {})] + [
         (f"T={t}", {"temperature": float(t), "top_p": 0.9, "no_repeat_ngram_size": 4}) for t in args.temperatures.split(",") if t
     ]
-    print(f"{len(prompts)} held-out prompts\n{'checkpoint':44s} {'decoding':8s} {'reward':>7s} {'words':>6s} {'all3':>5s} {'dialog':>7s} {'ended':>6s} {'openings':>9s} {'Lily':>5s}")
+    depths = [(f"{k} loops", {"thinking_effort": None, "num_loops": int(k)}) for k in args.loops.split(",") if k]
+    depths += [(f"halt<{h}", {"thinking_effort": None, "num_loops": args.max_loops, "halt_threshold": float(h)}) for h in args.halt_thresholds.split(",") if h]
+    if depths:  # depth sweep replaces the decoding sweep: greedy at each depth
+        decodings = depths
+    print(f"{len(prompts)} held-out prompts\n{'checkpoint':44s} {'setting':10s} {'reward':>7s} {'words':>6s} {'all3':>5s} {'dialog':>7s} {'ended':>6s} {'openings':>9s} {'Lily':>5s} {'loops':>6s}")
     for path in args.checkpoints:
         model, tokenizer = load_checkpoint(path, args.device)
         if not hasattr(model, "evolution_offset"):
@@ -65,7 +75,8 @@ def main() -> None:
         for label, decoding in decodings:
             s = score(model, tokenizer, prompts, device=args.device, max_new_tokens=args.max_new_tokens, kv_bits=args.kv_bits, **decoding)
             name = path.replace("\\", "/").split("/")[-1][:44]
-            print(f"{name:44s} {label:8s} {s['reward']:7.3f} {s['words']:6.2f} {s['all3']:5d} {s['dialogue']:7d} {s['ended']:6d} {s['openings']:9d} {s['lily']:5d}")
+            used = f"{s['loops']:6.2f}" if s["loops"] is not None else "     -"
+            print(f"{name:44s} {label:10s} {s['reward']:7.3f} {s['words']:6.2f} {s['all3']:5d} {s['dialogue']:7d} {s['ended']:6d} {s['openings']:9d} {s['lily']:5d} {used}")
 
 
 if __name__ == "__main__":

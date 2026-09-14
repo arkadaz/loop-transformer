@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, help="Seed sampling for reproducible sessions.")
     parser.add_argument("--kv-bits", type=int, default=0, choices=(0, 1, 2, 3, 4), help="TurboQuant bits for the decoder KV cache; 0 = exact.")
     parser.add_argument("--no-kv-cache", action="store_true", help="Recompute the decoder each step (slow, for checks).")
+    parser.add_argument("--max-loops", type=int, default=12, help="Loop cap for /effort auto.")
+    parser.add_argument("--halt-threshold", type=float, default=0.1, help="/effort auto stops a row when its relative state change drops below this.")
     args = parser.parse_args()
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -38,9 +40,9 @@ def main() -> None:
         model, tokenizer = load_checkpoint(args.checkpoint, device)
     except (FileNotFoundError, ValueError) as error:
         raise SystemExit(f"Cannot load checkpoint: {error}")
-    # Foundation training and its quality screen use high effort. Start there
-    # rather than silently testing a different (medium) computation path.
-    effort = "high"
+    # Measured on the instruction task: fixed-depth checkpoints score best at 3 loops
+    # (medium), not the 6 they trained at; depth-trained ones are flat from 1 to 8.
+    effort = "medium"
     stage = str(metadata.get("stage") or "unknown")
     quality = metadata.get("pretrain_quality") or {}
     ready = quality.get("passed") and quality.get("gate_version") == PRETRAIN_QUALITY_GATE_VERSION
@@ -70,7 +72,7 @@ def main() -> None:
         f"Decoding: temperature={temperature:g} (0 = greedy), top_p={args.top_p:g}, "
         f"no_repeat_ngram={args.no_repeat_ngram}, repetition_penalty={args.repetition_penalty:g}; "
         f"KV cache {'off' if args.no_kv_cache else ('TurboQuant ' + str(args.kv_bits) + '-bit' if args.kv_bits else 'exact')}. "
-        "Commands: /effort low|medium|high, /temp <value>, /exit"
+        "Commands: /effort low|medium|high|auto, /temp <value>, /exit"
     )
     while True:
         try:
@@ -83,9 +85,9 @@ def main() -> None:
             continue
         if user.startswith("/effort "):
             effort = user.split(maxsplit=1)[1]
-            if effort not in {"low", "medium", "high"}:
-                print("Use low, medium, or high.")
-                effort = "high"
+            if effort not in {"low", "medium", "high", "auto"}:
+                print("Use low, medium, high, or auto (stop when the encoder state stops changing).")
+                effort = "medium"
             continue
         if user.startswith("/temp "):
             try:
@@ -98,9 +100,12 @@ def main() -> None:
             print(f"Input has {len(ids)} tokens; using the last {input_limit} tokens.")
             ids = ids[-input_limit:]
         input_ids = torch.tensor([ids], device=device)
+        auto = effort == "auto"
         output = model.generate(
             input_ids,
-            thinking_effort=effort,
+            thinking_effort=None if auto else effort,
+            num_loops=args.max_loops if auto else None,
+            halt_threshold=args.halt_threshold if auto else None,
             max_new_tokens=args.max_new_tokens,
             temperature=temperature,
             top_p=args.top_p,
@@ -111,7 +116,8 @@ def main() -> None:
         )
         answer = tokenizer.decode(output[0, 1:], skip_special_tokens=True).strip()
         decoding = "greedy" if temperature == 0 else f"T={temperature:g} top_p={args.top_p:g}"
-        print(f"{answer_label} ({effort}, {model.resolve_loops(effort)} loops, {decoding}): {answer}")
+        loops = f"{int(model.loops_used[0])} loops used, cap {args.max_loops}" if auto else f"{model.resolve_loops(effort)} loops"
+        print(f"{answer_label} ({effort}, {loops}, {decoding}): {answer}")
 
 
 if __name__ == "__main__":
