@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 import torch
 from tqdm.auto import tqdm
 
-from src.data import story_checks
+from src.data import QA_PROMPT, qa_acceptable, story_checks
 
 
 GEMMA_TEACHER = "google/gemma-3-270m-it"
@@ -45,9 +45,9 @@ def ensure_teacher_access() -> None:
         raise TeacherAccessError(instructions) from error
 
 
-def _key(prompt: str, answer: str, config: TeacherConfig) -> str:
+def _key(prompt: str, answer: str, config: TeacherConfig, mode: str = "") -> str:
     payload = json.dumps(
-        {"teacher": GEMMA_TEACHER, "version": PROMPT_VERSION, "prompt": prompt, "answer": answer, **asdict(config)},
+        {"teacher": GEMMA_TEACHER, "version": PROMPT_VERSION, "prompt": prompt, "answer": answer, "mode": mode, **asdict(config)},
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -90,7 +90,20 @@ def _clean_story(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _messages(prompt: str, answer: str) -> list[dict[str, str]]:
+QA_REQUEST = (
+    "Read this story for young children. Write one simple question about what happens in it, then a short answer "
+    "that uses words from the story. Reply with exactly two lines and nothing else:\nQuestion: ...\nAnswer: ...\n\nStory:\n"
+)
+_QA_PAIR = re.compile(r"Question:\s*(.+?)\s*Answer:\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+
+def _clean_line(text: str) -> str:
+    return re.sub(r"[*#_`]+", "", text).strip().split("\n")[0].strip()
+
+
+def _messages(prompt: str, answer: str, mode: str = "") -> list[dict[str, str]]:
+    if mode == "qa":  # the teacher writes both the question and its answer about this passage
+        return [{"role": "user", "content": QA_REQUEST + prompt.strip()}]
     if not answer.strip():  # story mode: the prompt is the whole instruction and Gemma writes the response
         return [{"role": "user", "content": prompt.strip() + STORY_REQUEST}]
     return [{
@@ -179,13 +192,14 @@ def generate_explanations(
     device: str,
     *,
     return_completion_flags: bool = False,
+    modes: Sequence[str] | None = None,
 ) -> list[str] | list[tuple[str, bool]]:
     """Generate a batch of Gemma continuations, keeping cacheable answer order."""
     previous_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     try:
         encoded = tokenizer.apply_chat_template(
-            [_messages(prompt, answer) for prompt, answer in pairs],
+            [_messages(prompt, answer, mode) for (prompt, answer), mode in zip(pairs, modes or [""] * len(pairs))],
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True,
@@ -244,8 +258,9 @@ def augment_with_gemma(
         records: list[tuple[Mapping[str, Any], str, str, str, tuple[str, bool] | None]] = []
         missing: list[tuple[int, str, str, str]] = []
         for index, example in enumerate(batch):
-            prompt, answer = str(example["prompt"]), "" if example.get("mode") == "story" else str(example["target"])
-            key = _key(prompt, answer, config)
+            mode = str(example.get("mode", ""))
+            prompt, answer = str(example["prompt"]), "" if mode in {"story", "qa"} else str(example["target"])
+            key = _key(prompt, answer, config, mode)
             explanation = cache.get(key)
             if explanation is None:
                 missing.append((index, prompt, answer, key))
@@ -261,7 +276,7 @@ def augment_with_gemma(
                     model, tokenizer = load_teacher(device)
                 responses = generate_explanations(
                     model, tokenizer, [(prompt, answer) for _, prompt, answer, _ in missing], config, device,
-                    return_completion_flags=True,
+                    return_completion_flags=True, modes=[str(batch[index].get("mode", "")) for index, _, _, _ in missing],
                 )
             generated += len(missing)
             for (index, _prompt, _answer, key), response in zip(missing, responses, strict=True):
@@ -275,6 +290,18 @@ def augment_with_gemma(
             explanation, ended = response or ("", False)
             item = dict(example)
             item["teacher"] = GEMMA_TEACHER
+            if example.get("mode") == "qa":
+                match = _QA_PAIR.search(explanation)
+                question, written = (_clean_line(match.group(1)), _clean_line(match.group(2))) if match else ("", "")
+                if not qa_acceptable(question, written, str(example["passage"])):
+                    dropped += 1
+                    continue
+                item.update(
+                    prompt=QA_PROMPT.format(passage=example["passage"], question=question),
+                    target=written, reference_answer=written, question=question, mode="anchor", target_eos=True,
+                )
+                augmented.append(item)
+                continue
             if example.get("mode") == "story":
                 story = _clean_story(explanation)
                 word_fraction, dialogue_ok = story_checks(story, example)

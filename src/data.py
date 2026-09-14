@@ -162,6 +162,49 @@ def tinystories_continue(row: Mapping[str, Any]) -> Example:
     return {"prompt": " ".join(sentences[:cut]), "target": " " + " ".join(sentences[cut:]), "source": "tinystories_continue", "mode": "anchor"}
 
 
+QA_PROMPT = "Read the story and answer the question.\n\nStory: {passage}\n\nQuestion: {question}"
+_QA_STOPWORDS = frozenset("a an the is are was were be been am do does did of to in on at for with by it he she they them his her its that this and or but as so if then there here what who when where why how".split())
+
+
+def _content_words(text: str) -> list[str]:
+    return [word for word in re.findall(r"[a-z']+|\d+", text.lower()) if word not in _QA_STOPWORDS]
+
+
+def tinystories_qa(row: Mapping[str, Any], source: str) -> Example:
+    """A short passage from a story; Gemma writes the question and answer, verified against the passage."""
+    sentences = re.split(r"(?<=[.!?])\s+", row.get("story", "").replace("\n", " ").strip())
+    passage, used = [], 0
+    for sentence in sentences:
+        if passage and used + len(sentence.split()) > 55:
+            break
+        passage.append(sentence)
+        used += len(sentence.split())
+    text = " ".join(passage)
+    if len(passage) < 2 or used < 25:
+        return {"prompt": "", "target": "", "source": source}
+    return {"prompt": text, "target": "", "mode": "qa", "passage": text, "source": source}
+
+
+def qa_acceptable(question: str, answer: str, passage: str) -> bool:
+    """Keep only a short question-answer pair whose answer really comes from the passage."""
+    words = _content_words(answer)
+    if not words or not question.endswith("?") or not 4 <= len(question.split()) <= 20 or not 1 <= len(answer.split()) <= 12:
+        return False
+    known = set(_content_words(passage))
+    return sum(word in known for word in words) / len(words) >= 0.6
+
+
+def qa_checks(prediction: str, example: Mapping[str, Any]) -> tuple[float, float]:
+    """Return (token F1 against the reference answer, share of predicted words found in the passage)."""
+    predicted = _content_words(prediction)
+    reference = _content_words(str(example.get("reference_answer", "")))
+    if not predicted or not reference:
+        return 0.0, 0.0
+    overlap = sum((Counter(predicted) & Counter(reference)).values())
+    known = set(_content_words(str(example.get("passage", ""))))
+    return (2 * overlap / (len(predicted) + len(reference)) if overlap else 0.0), sum(word in known for word in predicted) / len(predicted)
+
+
 def story_checks(text: str, example: Mapping[str, Any]) -> tuple[float, bool]:
     """Return (share of required words present, dialogue requirement satisfied)."""
     lowered = text.lower()
@@ -196,6 +239,14 @@ SOURCES: dict[str, DatasetSource] = {
     "tinystories_continue": DatasetSource(
         "roneneldan/TinyStoriesInstruct", None, tinystories_continue,
         "CDLA-Sharing-1.0", rows=lambda n, seed: _instruct_rows("TinyStories-Instruct-train.txt", n, seed, name_cap=0.05),
+    ),
+    "tinystories_qa": DatasetSource(
+        "roneneldan/TinyStoriesInstruct", None, lambda row: tinystories_qa(row, "tinystories_qa"),
+        "CDLA-Sharing-1.0", rows=lambda n, seed: _instruct_rows("TinyStories-Instruct-train.txt", n, seed),
+    ),
+    "tinystories_qa_valid": DatasetSource(
+        "roneneldan/TinyStoriesInstruct", None, lambda row: tinystories_qa(row, "tinystories_qa_valid"),
+        "CDLA-Sharing-1.0", rows=lambda n, seed: _instruct_rows("TinyStories-Instruct-valid.txt", n, seed),
     ),
     "tinystories_instruct_valid": DatasetSource(
         "roneneldan/TinyStoriesInstruct", None, lambda row: tinystories_instruct(row, "tinystories_instruct_valid"),
@@ -241,7 +292,7 @@ def load_examples(
             loaded = 0
             for row in sample:
                 example = source.formatter(row)
-                if example["target"]:
+                if example["target"] or example.get("mode") == "qa":  # Q&A targets are written by the teacher
                     examples.append(example)
                     loaded += 1
             print(f"Loaded {loaded} {name} examples.")

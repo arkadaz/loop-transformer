@@ -9,7 +9,7 @@ from typing import Any, Sequence
 import torch
 from tqdm.auto import tqdm
 
-from src.data import SOURCES, load_examples, story_checks
+from src.data import SOURCES, load_examples, qa_checks, story_checks
 from src.pretrain_distill import DEFAULT_POSTTRAIN_CHECKPOINT, load_checkpoint, save_checkpoint, seed_everything, split_examples
 
 
@@ -35,6 +35,12 @@ def reward_for_answer(prediction: str, reference: str, *, ended: bool) -> float:
     tokens = predicted.split()
     repetition = max(Counter(tokens).values()) / len(tokens) if len(tokens) >= 4 else 0.0
     return match + (0.05 if ended else 0.0) - max(0.0, repetition - 0.5)
+
+
+def reward_for_qa(prediction: str, example: dict[str, Any], *, ended: bool) -> float:
+    """Token F1 against the reference answer, plus a small bonus for stopping cleanly."""
+    f1, _grounded = qa_checks(prediction, example)
+    return f1 + (0.05 if ended else 0.0)
 
 
 def reward_for_story(prediction: str, example: dict[str, Any], *, ended: bool) -> float:
@@ -75,7 +81,9 @@ def evaluate_offset(
             tokens = row[1:].tolist()
             ended = tokenizer.eos_token_id in tokens
             prediction = tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            if example.get("mode") == "story":
+            if example.get("question"):
+                rewards.append(reward_for_qa(prediction, example, ended=ended))
+            elif example.get("mode") == "story":
                 rewards.append(reward_for_story(prediction, example, ended=ended))
             else:
                 rewards.append(reward_for_answer(prediction, example["target"], ended=ended))

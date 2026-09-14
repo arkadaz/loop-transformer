@@ -8,7 +8,7 @@ The stages follow the usual sequence at toy scale: foundation -> quality anneali
 
 ```powershell
 uv sync
-uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-sft-depth-rft3.pt --max-new-tokens 160 --best-of 4
+uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-qa-02.pt --max-new-tokens 160 --best-of 4
 ```
 
 Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. `/effort auto` is meant for checkpoints trained with `--loop-range` (the `story-sft-depth-*` ones). `--best-of N` samples N stories and shows the one the verifier scores highest. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
@@ -26,13 +26,14 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | `src/gemma_teacher.py` | Gemma 3 270M IT access, batched generation, append-only target cache, story mode. |
 | `src/evolution.py` | CEM over the latent-thought offset with the answer reward and the rule-verified story reward. |
 | `src/rft.py` | Rejection-sampling fine-tuning data: N samples per prompt, keep the verifier-passing best; feeds `sft` via `--datasets jsonl:<path>`. |
+| `src/qa_build.py` | Story-grounded Q&A data: Gemma writes a question and answer per passage, a verifier keeps the grounded ones. |
 | `src/quant.py` | TurboQuant KV-cache compression: random rotation, Lloyd-Max codebooks, 1-bit QJL residual, bit-packed storage. |
 | `src/kv_bench.py` | KV-cache report: exactness, speed-up, fidelity per bit width, bytes per token. |
 | `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints (`--kv-bits` supported). |
-| `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (`--kv-bits` supported; produces the table below). |
+| `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (`--task story|qa`, `--kv-bits`; produces the tables below). |
 | `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
 | `configs/tinystories_foundation.json` | The pinned foundation corpus. |
-| `tests/` | 97 tests; `uv run python -m pytest -q`. |
+| `tests/` | 101 tests; `uv run python -m pytest -q`. |
 
 ## What the model is
 
@@ -251,6 +252,39 @@ Verifier reward on the 128 held-out prompts, greedy. Each round takes about 15 m
 | `story-sft-depth-rft3` | 1,759 / 7,653 (23%) | **0.605** | 0.51 | **21** | 100 | **0.600** (2.0) |
 
 The yield rises every round because the model it samples from is better, and every round so far has stayed inside the foundation-retention limit. The self-stopping checkpoint keeps stopping at 2 loops while gaining the same amount, so the gain is in the weights, not in extra compute. `play.py --best-of N` adds test-time selection on top: N samples, the verifier picks.
+
+## Story-grounded Q&A
+
+The model can also answer questions about a story it is given. That is extraction, not recall: the answer is in the prompt, which is what makes it reachable at 10M parameters. Gemma writes one question and a short answer per passage; a verifier keeps the pair only if the question is a real question, the answer is at most 12 words, and at least 60% of the answer's content words appear in the passage. 63% of Gemma's pairs pass.
+
+The training prompt is `Read the story and answer the question.\n\nStory: <passage>\n\nQuestion: <question>` and the target is the short answer.
+
+```powershell
+uv run python -m src.qa_build --source tinystories_qa --per-source 6000 --output data/qa_train.jsonl --seed 42
+uv run python -m src.qa_build --source tinystories_qa_valid --per-source 400 --output data/qa_valid.jsonl --seed 7
+uv run python main.py sft --init-checkpoint checkpoints/loop-transformer-10m-story-sft-depth-rft3.pt --output checkpoints/loop-transformer-10m-story-qa-02.pt --datasets jsonl:data/qa_train.jsonl,jsonl:data/rft_round3.jsonl,jsonl:data/rft_round3.jsonl,tinystories_instruct,tinystories_continue --per-source 12000 --validation-fraction 0.05 --epochs 3 --lr 3e-5 --warmup-steps 100 --min-lr-ratio 0.1 --batch-size 16 --max-input-tokens 128 --max-target-tokens 256 --teacher-tokens 220 --teacher-temperature 0.7 --teacher-batch-size 16 --allow-ungated --max-foundation-regression 0.35 --thinking-effort high --loop-range 1 8 --selection last --seed 42 --device cuda
+uv run python -m src.instruct_eval <checkpoints...> --task qa --prompts 128 --loops 4
+```
+
+119 held-out Q&A prompts, greedy at 4 loops. `F1` is token overlap with the reference answer, `grounded` the share of answer words found in the passage, `words` the mean answer length.
+
+| Checkpoint | Reward | F1 | Exact | Grounded | Ended | Words |
+| --- | --- | --- | --- | --- | --- | --- |
+| `story-sft-depth-rft3` (stories only) | 0.087 | 0.05 | 0 | 0.29 | 89 | 93.2 |
+| `story-qa-01` (Q&A weighted 2x) | 0.308 | 0.26 | 6 | 0.57 | 119 | 6.4 |
+| `story-qa-02` (Q&A 1x, story self-samples 2x) | 0.306 | 0.26 | 6 | 0.57 | 119 | 6.6 |
+
+Story reward on the same 128 story prompts, to show the cost of the second task:
+
+| Checkpoint | Story reward | All 3 words |
+| --- | --- | --- |
+| `story-sft-depth-rft3` | 0.605 | 21 |
+| `story-qa-01` | 0.536 | 16 |
+| `story-qa-02` | **0.579** | 17 |
+
+Before Q&A training the model answered every question with a 93-word story and ignored the question; after it, it produces a short answer, stops cleanly on every prompt, and takes more than half its words from the passage. Learning the second task costs some story quality: weighting Q&A 2x dropped story reward to 0.536, and weighting the story self-samples higher instead recovered it to 0.579 while Q&A stayed flat. `story-qa-02` is the model to use for both tasks; `story-sft-depth-rft3` remains the story specialist at 0.605.
+
+What this does not add: world knowledge (`What is the capital of France`) or arithmetic, which need a model far larger than 10M and were abandoned early in this project, and chitchat such as `hello`, for which there is no data in the mix at all.
 
 ## Scope
 
