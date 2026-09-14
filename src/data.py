@@ -1,4 +1,4 @@
-"""Small, answer-anchored datasets for Gemma-assisted student training."""
+"""SFT data sources: TinyStoriesInstruct story prompts with a rule verifier, continuation replay, and small QA sets."""
 from __future__ import annotations
 
 import random
@@ -201,9 +201,9 @@ SOURCES: dict[str, DatasetSource] = {
     ),
 }
 
-# Dolly supplies general single-turn instruction following. The remaining
-# sources have trusted short answers, which is important for later verifiers.
-DEFAULT_SOURCES = ("gsm8k", "arc_easy", "arc_challenge", "commonsenseqa", "finance_sentiment", "dolly")
+# The story sources are the trained recipe. The QA sources (trusted short answers,
+# Dolly for general instructions) remain selectable with --datasets.
+DEFAULT_SOURCES = ("tinystories_instruct", "tinystories_continue")  # the story SFT recipe; QA sources remain selectable
 
 
 def load_examples(

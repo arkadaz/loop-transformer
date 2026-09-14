@@ -2,7 +2,34 @@
 
 A **10M-parameter** text-only recurrent encoder-decoder trained from random weights. `google/gemma-3-270m-it` is the project's only teacher; it is frozen and used only to write SFT targets after the student has a healthy base checkpoint.
 
-The stages follow the usual sequence at toy scale: foundation -> quality annealing -> SFT -> verifier-grounded optimization. Every stage has now been run once on the TinyStories base. The foundation gate itself never passed, so SFT used `--allow-ungated`; see the results below before trusting any checkpoint.
+The stages follow the usual sequence at toy scale: foundation -> quality annealing -> SFT -> verifier-grounded optimization. Every stage has been run on the TinyStories base. The foundation gate itself never passed, so SFT used `--allow-ungated`; read the results below before trusting any checkpoint. [CHANGELOG.md](CHANGELOG.md) records the full history, including what was tried and rejected.
+
+## Quick start
+
+```powershell
+uv sync
+uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-evolved-03.pt --max-new-tokens 160
+```
+
+Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
+
+## Repository layout
+
+| Path | Role |
+| --- | --- |
+| `main.py` | Dispatches `pretrain`, `anneal`, `sft`/`posttrain`, `evolve`. |
+| `play.py` | Interactive runner with sampling controls. |
+| `src/model.py` | The loop transformer: recurrent encoder, latent thoughts, decoder with prompt prefill, sampling helper. |
+| `src/pretrain.py` | Foundation trainer: streamed mixture loader, windowing, quality gate, anchor, rollout-guarded selection. |
+| `src/pretrain_distill.py` | Shared training loop, checkpoint save/load, the SFT stage with its foundation-retention guard. |
+| `src/data.py` | SFT data sources (TinyStoriesInstruct story prompts, continuation replay, GSM8K/ARC/CommonsenseQA/finance/Dolly) and the story verifier. |
+| `src/gemma_teacher.py` | Gemma 3 270M IT access, batched generation, append-only target cache, story mode. |
+| `src/evolution.py` | CEM over the latent-thought offset with the answer reward and the rule-verified story reward. |
+| `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints. |
+| `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (produces the table below). |
+| `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
+| `configs/tinystories_foundation.json` | The pinned foundation corpus. |
+| `tests/` | 88 tests; `uv run python -m pytest -q`. |
 
 ## What the model is
 
@@ -42,7 +69,7 @@ The runner keeps the weights with the best held-out loss, stores a fixed 64-exam
 uv run python -m src.story_eval --checkpoint checkpoints/loop-transformer-10m-tinystories-prefill-long-02.pt --device cuda
 # same panel with sampling; written to a separate *.story-eval.sampled.json
 uv run python -m src.story_eval --checkpoint checkpoints/loop-transformer-10m-tinystories-prefill-long-02.pt --device cuda --temperature 0.7 --top-p 0.9 --no-repeat-ngram 4
-# interactive; sampling is the default, /temp 0 switches to greedy
+# interactive; sampling at T=1.0 is the default, /temp 0 switches to greedy
 uv run python play.py --checkpoint checkpoints/loop-transformer-10m-tinystories-prefill-long-02.pt --max-new-tokens 128
 ```
 
@@ -55,9 +82,9 @@ Healthy completions out of 32 on the frozen validation panel:
 | `tinystories-prefill-long-02` (+86M) | 20 | 6 | 29 | 18 |
 | `tinystories-prefill-long-03.partial` (+86M, see note) | 20 | 5 | 28 | 18 |
 
-Note: the third pass improved held-out loss (1.634 to 1.598) but the trainer's greedy rollout guard rejected the trained weights, so `long-03.pt` holds the long-02 weights again. The trained weights survive in `long-03.partial.pt` and are what the last row measures. Another 86M tokens of the same recipe changed nothing on the panel: this recipe has plateaued.
+Note: the third pass improved held-out loss (1.634 to 1.598) but the trainer's greedy rollout guard rejected the trained weights and rolled back to long-02; the last row measured the discarded weights (since deleted). Another 86M tokens of the same recipe changed nothing on the panel: this recipe has plateaued.
 
-Sampled = temperature 0.7, top-p 0.9, repeated 4-gram block, seed 0. Greedy decoding of a 10M model loops; sampling removes most of that. What sampling does not fix is situation drift: a prompt about finding a toy can turn into a story about a dog stealing it. That is a capacity and data limit, not a decoding bug.
+Sampled here = temperature 0.7, top-p 0.9, repeated 4-gram block, seed 0. Greedy decoding of a 10M model loops; sampling removes most of that. What sampling does not fix is situation drift: a prompt about finding a toy can turn into a story about a dog stealing it. That is a capacity and data limit, not a decoding bug.
 
 ### Tried and rejected (do not repeat)
 
@@ -84,7 +111,12 @@ uv run python main.py evolve --init-checkpoint checkpoints/loop-transformer-10m-
 uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-sft-05.pt --max-new-tokens 160
 ```
 
-Prompt format the SFT model expects: `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` (optionally `The story is about: ...`). Gemma targets are cached in `.cache/gemma_targets.jsonl`, so reruns only train.
+Prompt format the SFT model expects: `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` (optionally `The story is about: ...` and `Include this sentence: ...`). Gemma targets are cached in `.cache/gemma_targets.jsonl`, so reruns only train.
+
+```powershell
+# the table below
+uv run python -m src.instruct_eval checkpoints/loop-transformer-10m-tinystories-prefill-long-02.pt checkpoints/loop-transformer-10m-story-sft-05.pt checkpoints/loop-transformer-10m-story-evolved-03.pt --prompts 128 --temperatures 0.7,1.0
+```
 
 Verifier reward on 128 held-out Instruct prompts (max about 1.15). `all 3` = completions using every required word; `openings` = distinct first four words across the 128 completions; `Lily` = completions that mention Lily. Sampled rows use top-p 0.9 and a repeated-4-gram block.
 
@@ -114,8 +146,8 @@ What the table says:
 What made SFT work, after three rejected attempts:
 
 - Train at the foundation's loop count (`--thinking-effort high`). The old default cycled low/medium/high per step and dragged the shared block away from its 6-loop behaviour (+0.39 anchor regression after one epoch).
-- A fine-tuning learning rate with warmup and cosine decay (3e-5, 50 warmup steps). At a flat 1e-4 the anchor regressed +0.32 even with replay.
-- Replay: half the examples are plain prefix -> continuation pairs, with the leading space that pretraining continuations carry.
+- A fine-tuning learning rate with warmup and cosine decay (3e-5 for 2.4k prompts, 2e-5 for 7k). At a flat 1e-4 the anchor regressed +0.32 even with replay.
+- Replay: about 60% of the examples are plain prefix -> continuation pairs, with the leading space that pretraining continuations carry.
 - Three epochs. Validation loss bottomed at epoch 2 to 3, then the model memorized. With 7k prompts only epoch 1 stayed inside the anchor limit; the saved sft-05/06 weights are epoch 1.
 - Run one GPU job at a time. Three concurrent CUDA jobs exhausted the 16 GB card and the driver killed all of them.
 

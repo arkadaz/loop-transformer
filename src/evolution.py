@@ -1,4 +1,4 @@
-"""Black-box evolutionary post-training over a small latent-thought offset."""
+"""Black-box evolutionary post-training over a small latent-thought offset, scored by rule verifiers."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ from src.data import SOURCES, load_examples, story_checks
 from src.pretrain_distill import DEFAULT_POSTTRAIN_CHECKPOINT, load_checkpoint, save_checkpoint, seed_everything, split_examples
 
 
-DEFAULT_SOURCES = "gsm8k,arc_easy,arc_challenge,commonsenseqa,finance_sentiment"
+DEFAULT_SOURCES = "tinystories_instruct_valid"
 _ANSWER_TOKEN = re.compile(r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)|[a-z]+")
 
 
