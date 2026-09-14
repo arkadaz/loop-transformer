@@ -52,6 +52,11 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 - Three concurrent CUDA jobs exhausted the 16 GB card and the driver killed all of them, losing a 128-prompt evolution run. GPU work is now sequential.
 - Cleanup for the first push: 15 MB session log, two legacy root checkpoints, four unused mixture configs, and 80 dead checkpoints (9.1 GB to 540 MB) deleted; `*.pt` ignored.
 
+### KV cache and TurboQuant
+
+- Decoder KV cache (per-layer self-attention keys/values, encoder cross-attention projections computed once). Exact: 32/32 greedy sequences identical to the uncached path; batch-32 generation 30x faster. On by default everywhere generation happens.
+- TurboQuant-style compression of the self-attention cache (`src/quant.py`): random rotation, Lloyd-Max codebooks at 1 to 4 bits, bit-packed codes, fp16 norms, 1-bit QJL residual for unbiased attention scores. 4-bit: 312 bytes per token per layer against 1024 for fp16, 94% next-token agreement, KL 0.011. `src/kv_bench.py` reproduces the table.
+
 ### Final checkpoints kept on disk (not in git)
 
 | File | Role |

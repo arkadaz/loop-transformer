@@ -25,11 +25,13 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | `src/data.py` | SFT data sources (TinyStoriesInstruct story prompts, continuation replay, GSM8K/ARC/CommonsenseQA/finance/Dolly) and the story verifier. |
 | `src/gemma_teacher.py` | Gemma 3 270M IT access, batched generation, append-only target cache, story mode. |
 | `src/evolution.py` | CEM over the latent-thought offset with the answer reward and the rule-verified story reward. |
+| `src/quant.py` | TurboQuant KV-cache compression: random rotation, Lloyd-Max codebooks, 1-bit QJL residual, bit-packed storage. |
+| `src/kv_bench.py` | KV-cache report: exactness, speed-up, fidelity per bit width, bytes per token. |
 | `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints. |
 | `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (produces the table below). |
 | `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
 | `configs/tinystories_foundation.json` | The pinned foundation corpus. |
-| `tests/` | 88 tests; `uv run python -m pytest -q`. |
+| `tests/` | 93 tests; `uv run python -m pytest -q`. |
 
 ## What the model is
 
@@ -151,9 +153,40 @@ What made SFT work, after three rejected attempts:
 - Three epochs. Validation loss bottomed at epoch 2 to 3, then the model memorized. With 7k prompts only epoch 1 stayed inside the anchor limit; the saved sft-05/06 weights are epoch 1.
 - Run one GPU job at a time. Three concurrent CUDA jobs exhausted the 16 GB card and the driver killed all of them.
 
-## Long context and TurboQuant
+## KV cache and TurboQuant
 
-The model uses learned absolute positions and materialized quadratic attention: no RoPE, no KV cache, no 4k context. Raising the length setting would not teach retrieval. TurboQuant is inference-time KV-cache compression and is irrelevant until a KV-cached generator exists.
+Generation keeps a decoder KV cache: each layer stores its self-attention keys and values and computes the encoder cross-attention projections once, so a step processes only the new token. The cache reproduces the uncached outputs exactly (32/32 greedy sequences identical on real prompts) and is on by default in `generate`, `play.py`, the evaluators and the evolution stage.
+
+`--kv-bits {1,2,3,4}` compresses the self-attention cache with a TurboQuant-style scheme (`src/quant.py`), data-oblivious and calibration-free:
+
+1. Normalise each key or value vector, rotate it by a fixed random orthogonal matrix so its coordinates are near-Gaussian, and round every coordinate to the MSE-optimal Lloyd-Max codebook for N(0, 1) at the chosen bit width. Codes are bit-packed; the vector norm is kept in fp16.
+2. For keys, sketch the rounding residual with a random Gaussian projection and keep one sign bit per coordinate (Quantized Johnson-Lindenstrauss). The attention score is then `q . k_hat + sqrt(pi/2)/d * |r| * <S q, sign(S r)>`, an unbiased estimate of `q . k`. The test suite checks that plain dequantisation understates correlated scores by more than 5% while the QJL-corrected score is unbiased within 2%.
+3. Values use step 1 only.
+
+Measured on `story-sft-05`, 32 held-out prompts, 160 new tokens, RTX 5070 Ti (`uv run python -m src.kv_bench`):
+
+| Cache | Bits K / V per coordinate | Bytes per token per layer | Mean abs. logit change | Top-1 agreement | KL(exact, quantised) |
+| --- | --- | --- | --- | --- | --- |
+| exact fp32 (fp16 equivalent) | 32 (16) | 2048 (1024) | 0 | 100% | 0 |
+| TurboQuant 4-bit | 5.5 / 4.25 | 312 | 0.16 | 94.0% | 0.011 |
+| TurboQuant 3-bit | 4.5 / 3.25 | 248 | 0.31 | 86.6% | 0.046 |
+| TurboQuant 2-bit | 3.5 / 2.25 | 184 | 0.62 | 75.9% | 0.214 |
+| TurboQuant 1-bit | 2.5 / 1.25 | 120 | 1.17 | 57.5% | 0.789 |
+
+Speed: batch 32 x 160 tokens went from 19.2 s to 0.6 s (30x); batch 1 from 0.7 s to 0.6 s, because at batch 1 the per-step launch overhead dominates a 10M model. Bit widths are effective values including the fp16 norms and the QJL sign bit (head dimension 64). Mean |logit| is 3.6 for scale.
+
+Verifier reward of `story-evolved-03` on the 128-prompt panel (greedy) with the compressed cache:
+
+| Cache | Reward | All 3 words | Openings | Lily |
+| --- | --- | --- | --- | --- |
+| exact | 0.419 | 6 | 51 | 79 |
+| TurboQuant 4-bit | 0.408 | 3 | 54 | 77 |
+| TurboQuant 3-bit | 0.408 | 3 | 52 | 80 |
+| TurboQuant 2-bit | 0.391 | 2 | 55 | 79 |
+
+Honest framing: this model's whole cache is a few hundred kilobytes, so compression buys nothing in practice here. The implementation is the point: it is the mechanism a long-context version would need, measured end to end.
+
+What this does not do: the model still uses learned absolute positions up to 512 tokens and materialised attention. Long context needs RoPE plus a context curriculum and retraining; a KV cache does not extend the trained length.
 
 ## Scope
 

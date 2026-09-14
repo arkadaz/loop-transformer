@@ -114,6 +114,7 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--no-repeat-ngram", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed; ignored for greedy decoding.")
+    parser.add_argument("--kv-bits", type=int, default=0, choices=(0, 1, 2, 3, 4), help="TurboQuant bits for the KV cache; 0 = exact.")
     args = parser.parse_args()
     decoding = {
         "temperature": args.temperature,
@@ -122,6 +123,7 @@ def main() -> None:
         "no_repeat_ngram_size": args.no_repeat_ngram,
     }
     sampled = decoding != GREEDY_DECODING
+    decoding["kv_bits"] = args.kv_bits
     torch.manual_seed(args.seed)
     checkpoint = Path(args.checkpoint)
     metadata = checkpoint_metadata(checkpoint)

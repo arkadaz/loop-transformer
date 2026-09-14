@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="1.0 disables the penalty.")
     parser.add_argument("--no-repeat-ngram", type=int, default=4, help="Block repeating any generated n-gram of this size; 0 disables.")
     parser.add_argument("--seed", type=int, help="Seed sampling for reproducible sessions.")
+    parser.add_argument("--kv-bits", type=int, default=0, choices=(0, 1, 2, 3, 4), help="TurboQuant bits for the decoder KV cache; 0 = exact.")
+    parser.add_argument("--no-kv-cache", action="store_true", help="Recompute the decoder each step (slow, for checks).")
     args = parser.parse_args()
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -66,7 +68,8 @@ def main() -> None:
         f"{context_status}. "
         f"Decoder prompt prefill={model.config.decoder_prompt_prefill_tokens}. "
         f"Decoding: temperature={temperature:g} (0 = greedy), top_p={args.top_p:g}, "
-        f"no_repeat_ngram={args.no_repeat_ngram}, repetition_penalty={args.repetition_penalty:g}. "
+        f"no_repeat_ngram={args.no_repeat_ngram}, repetition_penalty={args.repetition_penalty:g}; "
+        f"KV cache {'off' if args.no_kv_cache else ('TurboQuant ' + str(args.kv_bits) + '-bit' if args.kv_bits else 'exact')}. "
         "Commands: /effort low|medium|high, /temp <value>, /exit"
     )
     while True:
@@ -103,6 +106,8 @@ def main() -> None:
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram,
+            use_cache=not args.no_kv_cache,
+            kv_bits=args.kv_bits,
         )
         answer = tokenizer.decode(output[0, 1:], skip_special_tokens=True).strip()
         decoding = "greedy" if temperature == 0 else f"T={temperature:g} top_p={args.top_p:g}"

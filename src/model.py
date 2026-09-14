@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.quant import TurboQuant
+
 
 @dataclass
 class LoopTransformerConfig:
@@ -65,6 +67,9 @@ class Attention(nn.Module):
         self.v = nn.Linear(d_model, d_model, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
 
+    def _split(self, x: torch.Tensor) -> torch.Tensor:
+        return x.view(x.shape[0], x.shape[1], self.n_heads, self.head_dim).transpose(1, 2)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -72,18 +77,27 @@ class Attention(nn.Module):
         context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
         causal: bool = False,
+        slot: "CacheSlot | None" = None,
     ) -> torch.Tensor:
         batch, query_len, width = x.shape
         context = x if context is None else context
-        key_len = context.shape[1]
-        q = self.q(x).view(batch, query_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k(context).view(batch, key_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v(context).view(batch, key_len, self.n_heads, self.head_dim).transpose(1, 2)
-        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        q = self._split(self.q(x))
+        if slot is not None and slot.static and slot.filled:
+            k, v = slot.k, slot.v  # encoder projections computed once per generation
+        else:
+            k, v = self._split(self.k(context)), self._split(self.v(context))
+            if slot is not None and slot.static:
+                slot.k, slot.v = k, v
+        if slot is not None and not slot.static:
+            scores, v = slot.append(q, k, v)  # growing cache; keys may be quantised, so the slot scores them
+        else:
+            scores = q @ k.transpose(-2, -1)
+        scores = scores / math.sqrt(self.head_dim)
+        key_len = scores.shape[-1]
 
-        if causal:
+        if causal:  # new queries sit after any cached keys
             scores.masked_fill_(
-                torch.triu(torch.ones(query_len, key_len, device=x.device, dtype=torch.bool), diagonal=1),
+                torch.triu(torch.ones(query_len, key_len, device=x.device, dtype=torch.bool), diagonal=key_len - query_len + 1),
                 float("-inf"),
             )
         if key_mask is not None:
@@ -93,6 +107,55 @@ class Attention(nn.Module):
 
         output = F.softmax(scores, dim=-1) @ v
         return self.out(output.transpose(1, 2).contiguous().view(batch, query_len, width))
+
+
+class CacheSlot:
+    """K/V for one attention module. ``static`` slots hold encoder projections computed once;
+    growing slots append per step and may hold TurboQuant-compressed keys and values."""
+
+    def __init__(self, quantizer: TurboQuant | None = None, static: bool = False):
+        self.quantizer, self.static = quantizer, static
+        self.k = self.v = self.keys = self.values = None
+
+    @property
+    def filled(self) -> bool:
+        return self.k is not None or self.keys is not None
+
+    @property
+    def length(self) -> int:
+        if self.k is not None:
+            return self.k.shape[2]
+        return 0 if self.keys is None else self.keys.codes.shape[2]
+
+    def append(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Store new keys/values; return (unscaled scores of q against every key, every value)."""
+        if self.quantizer is None:
+            self.k = k if self.k is None else torch.cat([self.k, k], dim=2)
+            self.v = v if self.v is None else torch.cat([self.v, v], dim=2)
+            return q @ self.k.transpose(-2, -1), self.v
+        keys, values = self.quantizer.quantize_keys(k), self.quantizer.quantize_values(v)
+        self.keys = keys if self.keys is None else self.keys.cat(keys)
+        self.values = values if self.values is None else self.values.cat(values)
+        return self.quantizer.key_scores(q, self.keys), self.quantizer.dequantize_values(self.values).to(q.dtype)
+
+    def nbytes(self) -> int:
+        if self.quantizer is None:
+            return sum(t.numel() * t.element_size() for t in (self.k, self.v) if t is not None)
+        return self.keys.nbytes() + self.values.nbytes() if self.keys is not None else 0
+
+
+class KVCache:
+    """Per decoder layer: a growing self-attention slot and a static cross-attention slot."""
+
+    def __init__(self, num_layers: int, quantizer: TurboQuant | None = None):
+        self.layers = [(CacheSlot(quantizer), CacheSlot(static=True)) for _ in range(num_layers)]
+
+    @property
+    def length(self) -> int:
+        return self.layers[0][0].length
+
+    def nbytes(self, *, self_attention_only: bool = False) -> int:
+        return sum(s.nbytes() + (0 if self_attention_only else c.nbytes()) for s, c in self.layers)
 
 
 class FeedForward(nn.Module):
@@ -137,9 +200,11 @@ class DecoderBlock(nn.Module):
         encoder_hidden: torch.Tensor,
         target_mask: torch.Tensor | None,
         encoder_mask: torch.Tensor,
+        slots: tuple[CacheSlot, CacheSlot] | None = None,
     ) -> torch.Tensor:
-        x = x + self.self_attention(self.self_norm(x), key_mask=target_mask, causal=True)
-        x = x + self.cross_attention(self.cross_norm(x), context=encoder_hidden, key_mask=encoder_mask)
+        self_slot, cross_slot = slots if slots is not None else (None, None)
+        x = x + self.self_attention(self.self_norm(x), key_mask=target_mask, causal=True, slot=self_slot)
+        x = x + self.cross_attention(self.cross_norm(x), context=encoder_hidden, key_mask=encoder_mask, slot=cross_slot)
         return x + self.mlp(self.mlp_norm(x))
 
 
@@ -189,10 +254,10 @@ class LoopTransformer(nn.Module):
         )
         return torch.cat([latent_mask, attention_mask.bool()], dim=1)
 
-    def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        if token_ids.shape[1] > self.config.max_seq_len:
+    def _embed(self, token_ids: torch.Tensor, start: int = 0) -> torch.Tensor:
+        if start + token_ids.shape[1] > self.config.max_seq_len:
             raise ValueError(f"Sequence exceeds max_seq_len={self.config.max_seq_len}.")
-        positions = torch.arange(token_ids.shape[1], device=token_ids.device).unsqueeze(0)
+        positions = torch.arange(start, start + token_ids.shape[1], device=token_ids.device).unsqueeze(0)
         return self.token_embedding(token_ids) + self.position_embedding(positions)
 
     def encode(
@@ -226,10 +291,12 @@ class LoopTransformer(nn.Module):
         encoder_hidden: torch.Tensor,
         encoder_mask: torch.Tensor,
         target_mask: torch.Tensor | None = None,
+        cache: KVCache | None = None,
     ) -> torch.Tensor:
-        hidden = self._embed(target_ids)
-        for block in self.decoder:
-            hidden = block(hidden, encoder_hidden, target_mask, encoder_mask)
+        """With a cache, ``target_ids`` are only the new positions and ``target_mask`` covers all cached ones."""
+        hidden = self._embed(target_ids, start=cache.length if cache is not None else 0)
+        for index, block in enumerate(self.decoder):
+            hidden = block(hidden, encoder_hidden, target_mask, encoder_mask, slots=cache.layers[index] if cache is not None else None)
         return self.lm_head(self.decoder_norm(hidden))
 
     def forward(
@@ -333,9 +400,15 @@ class LoopTransformer(nn.Module):
         no_repeat_ngram_size: int = 0,
         start_token_id: int | None = None,
         eos_token_id: int | None = None,
+        use_cache: bool = True,
+        kv_bits: int = 0,
     ) -> torch.Tensor:
+        """``use_cache`` reproduces the uncached outputs exactly; ``kv_bits`` in 1..4 TurboQuant-compresses the
+        self-attention cache (0 keeps it in full precision). The last cache is kept on ``self.kv_cache``."""
         if temperature < 0 or not 0 < top_p <= 1 or repetition_penalty <= 0 or no_repeat_ngram_size < 0:
             raise ValueError("Use temperature >= 0, 0 < top_p <= 1, repetition_penalty > 0, no_repeat_ngram_size >= 0.")
+        if kv_bits not in (0, 1, 2, 3, 4):
+            raise ValueError("kv_bits must be 0 (exact) or 1..4.")
         loops = self.resolve_loops(thinking_effort, num_loops)
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
         if eos_token_id is None:
@@ -353,12 +426,16 @@ class LoopTransformer(nn.Module):
         encoder_hidden, _ = self.encode(input_ids, attention_mask=input_attention_mask, num_loops=loops)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         returned = visible_start
+        quantizer = TurboQuant(self.config.d_model // self.config.n_heads, kv_bits, kv_bits, device=input_ids.device) if kv_bits else None
+        self.kv_cache = cache = KVCache(len(self.decoder), quantizer) if use_cache else None
+        pending = generated  # tokens not yet in the cache: the whole prefill first, then one token per step
         for _ in range(max_new_tokens):
             logits = self.decode(
-                generated,
+                pending if cache is not None else generated,
                 encoder_hidden,
                 encoder_mask,
                 generated_mask,
+                cache=cache,
             )[:, -1]
             next_token = self._sample_next_token(
                 logits,
@@ -371,6 +448,7 @@ class LoopTransformer(nn.Module):
             next_token = torch.where(finished[:, None], torch.full_like(next_token, eos_token_id), next_token)
             generated = torch.cat([generated, next_token], dim=1)
             generated_mask = torch.cat([generated_mask, torch.ones_like(next_token, dtype=torch.bool)], dim=1)
+            pending = next_token
             # Keep the long internal prefill private: callers always receive
             # [decoder start, generated tokens], as before this feature.
             returned = torch.cat([returned, next_token], dim=1)

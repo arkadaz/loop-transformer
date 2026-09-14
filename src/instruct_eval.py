@@ -48,6 +48,7 @@ def main() -> None:
     parser.add_argument("--temperatures", default="1.0", help="Comma-separated sampling temperatures; greedy is always included.")
     parser.add_argument("--max-new-tokens", type=int, default=160)
     parser.add_argument("--seed", type=int, default=7, help="Must match the evolve run's --seed for the same split.")
+    parser.add_argument("--kv-bits", type=int, default=0, choices=(0, 1, 2, 3, 4), help="TurboQuant bits for the KV cache; 0 = exact.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     raw = load_examples(("tinystories_instruct_valid",), per_source=800, seed=args.seed)
@@ -62,7 +63,7 @@ def main() -> None:
         if not hasattr(model, "evolution_offset"):
             model.evolution_offset = torch.zeros(model.config.num_latent_thoughts, model.config.d_model, device=args.device)
         for label, decoding in decodings:
-            s = score(model, tokenizer, prompts, device=args.device, max_new_tokens=args.max_new_tokens, **decoding)
+            s = score(model, tokenizer, prompts, device=args.device, max_new_tokens=args.max_new_tokens, kv_bits=args.kv_bits, **decoding)
             name = path.replace("\\", "/").split("/")[-1][:44]
             print(f"{name:44s} {label:8s} {s['reward']:7.3f} {s['words']:6.2f} {s['all3']:5d} {s['dialogue']:7d} {s['ended']:6d} {s['openings']:9d} {s['lily']:5d}")
 
