@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Reproducible-but-local teacher response caches
+.cache/
+
+# Training outputs (the existing legacy checkpoints are intentionally preserved)
+checkpoints/
+
+# Local run logs
+logs/
+
+# Model files never belong in git
+*.pt

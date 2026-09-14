@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "dataset": "roneneldan/TinyStories",
+      "config": "default",
+      "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
+      "text_field": "text",
+      "train_split": "train",
+      "validation_split": "validation",
+      "use_fallback_validation": false,
+      "weight": 100
+    }
+  ]
+}
