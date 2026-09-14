@@ -8,10 +8,10 @@ The stages follow the usual sequence at toy scale: foundation -> quality anneali
 
 ```powershell
 uv sync
-uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-evolved-03.pt --max-new-tokens 160
+uv run python play.py --checkpoint checkpoints/loop-transformer-10m-story-sft-depth-rft3.pt --max-new-tokens 160 --best-of 4
 ```
 
-Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. `/effort auto` is meant for checkpoints trained with `--loop-range` (`story-sft-depth-01.pt`). Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
+Then type a prompt in the trained format, for example `Write a short story for young children. Use the words: dog, ball, happy. Include dialogue.` Optional additions: `The story is about: <one line>` and `Include this sentence: <sentence>`. `/temp 0.7` gives more coherent, less varied stories; `/temp 0` is greedy. Add `--kv-bits 3` to run with a compressed KV cache, or `--no-kv-cache` to recompute each step. `/effort auto` is meant for checkpoints trained with `--loop-range` (the `story-sft-depth-*` ones). `--best-of N` samples N stories and shows the one the verifier scores highest. Checkpoints are not in git; the commands below rebuild them in about two hours on an RTX 5070 Ti.
 
 ## Repository layout
 
@@ -25,13 +25,14 @@ Then type a prompt in the trained format, for example `Write a short story for y
 | `src/data.py` | SFT data sources (TinyStoriesInstruct story prompts, continuation replay, GSM8K/ARC/CommonsenseQA/finance/Dolly) and the story verifier. |
 | `src/gemma_teacher.py` | Gemma 3 270M IT access, batched generation, append-only target cache, story mode. |
 | `src/evolution.py` | CEM over the latent-thought offset with the answer reward and the rule-verified story reward. |
+| `src/rft.py` | Rejection-sampling fine-tuning data: N samples per prompt, keep the verifier-passing best; feeds `sft` via `--datasets jsonl:<path>`. |
 | `src/quant.py` | TurboQuant KV-cache compression: random rotation, Lloyd-Max codebooks, 1-bit QJL residual, bit-packed storage. |
 | `src/kv_bench.py` | KV-cache report: exactness, speed-up, fidelity per bit width, bytes per token. |
 | `src/story_eval.py` | Frozen 32-story continuation report for foundation checkpoints (`--kv-bits` supported). |
 | `src/instruct_eval.py` | Verifier reward and variety report for SFT/evolution checkpoints (`--kv-bits` supported; produces the table below). |
 | `src/student_tokenizer.py` | 8k byte-level BPE trainer, embedded in checkpoints. |
 | `configs/tinystories_foundation.json` | The pinned foundation corpus. |
-| `tests/` | 95 tests; `uv run python -m pytest -q`. |
+| `tests/` | 97 tests; `uv run python -m pytest -q`. |
 
 ## What the model is
 
@@ -227,6 +228,29 @@ What it means:
 - **The fixed-depth model was mis-operated.** Its best operating point is 3 loops (0.495), not the 6 it trained at (0.410). `play.py` now defaults to `medium`. Any halting rule is useless on it because its state never converges.
 - **Beyond the trained range, both degrade** (12 loops), so the halting cap should stay inside it.
 - A learned halting head (PonderNet or ACT with a ponder cost) is only worth adding for a task where more loops demonstrably help; on this data they do not.
+
+## Rejection-sampling fine-tuning: the step that made it smarter
+
+Evolution only moves a 1,024-value offset. To move the whole model toward the verifier, train it on its own verified successes (expert iteration): sample 8 stories per training prompt at T=1.0, keep a sample only if it uses every required word, has dialogue when asked, ends with EOS and repeats no more than 8% of its 4-grams, then fine-tune on those stories (weighted 2 to 3x) together with the dataset stories and continuation replay, and repeat from the improved model.
+
+```powershell
+uv run python -m src.rft --checkpoint checkpoints/loop-transformer-10m-story-sft-depth-01.pt --output data/rft_round1.jsonl --samples 8 --loops 4 --temperature 1.0 --top-p 0.9 --seed 42
+uv run python main.py sft --init-checkpoint checkpoints/loop-transformer-10m-story-sft-depth-01.pt --output checkpoints/loop-transformer-10m-story-sft-depth-rft1.pt --datasets jsonl:data/rft_round1.jsonl,jsonl:data/rft_round1.jsonl,jsonl:data/rft_round1.jsonl,tinystories_instruct,tinystories_continue --per-source 12000 --validation-fraction 0.05 --epochs 3 --lr 3e-5 --warmup-steps 100 --min-lr-ratio 0.1 --batch-size 16 --max-input-tokens 128 --max-target-tokens 256 --teacher-tokens 220 --teacher-temperature 0.7 --teacher-batch-size 16 --allow-ungated --max-foundation-regression 0.35 --thinking-effort high --loop-range 1 8 --seed 42 --device cuda
+# round 2, 3, ...: sample from the new checkpoint (new --seed), fine-tune with the new file weighted 2x plus the earlier files,
+# and add --selection last: on a validation set made of the model's own samples the LM loss cannot improve, the verifier reward is the objective
+```
+
+Verifier reward on the 128 held-out prompts, greedy. Each round takes about 15 minutes on the RTX 5070 Ti (7 minutes of sampling with the KV cache, 5 of training, 2 of evaluation).
+
+| Checkpoint | Verified samples kept | Reward, 4 loops | Words used | All 3 words | Ended | Reward, auto (loops used) |
+| --- | --- | --- | --- | --- | --- | --- |
+| base `long-02` | - | 0.214 | 0.17 | 0 | 116 | - |
+| `story-sft-depth-01` | - | 0.459 | 0.35 | 4 | 95 | 0.438 (2.0) |
+| `story-sft-depth-rft1` | 861 / 7,634 (11%) | 0.511 | 0.43 | 10 | 87 | 0.471 (2.0) |
+| `story-sft-depth-rft2` | 1,263 / 7,620 (17%) | 0.580 | 0.49 | 13 | 98 | 0.547 (2.0) |
+| `story-sft-depth-rft3` | 1,759 / 7,653 (23%) | **0.605** | 0.51 | **21** | 100 | **0.600** (2.0) |
+
+The yield rises every round because the model it samples from is better, and every round so far has stayed inside the foundation-retention limit. The self-stopping checkpoint keeps stopping at 2 loops while gaining the same amount, so the gain is in the weights, not in extra compute. `play.py --best-of N` adds test-time selection on top: N samples, the verifier picks.
 
 ## Scope
 

@@ -4,7 +4,10 @@ from pathlib import Path
 
 import torch
 
+import re
+
 from src.pretrain_distill import PRETRAIN_QUALITY_GATE_VERSION, checkpoint_metadata, load_checkpoint
+from src.rft import best_candidate
 
 
 def input_context_limit(metadata: dict, config_max: int) -> tuple[int, bool]:
@@ -30,6 +33,7 @@ def main() -> None:
     parser.add_argument("--no-kv-cache", action="store_true", help="Recompute the decoder each step (slow, for checks).")
     parser.add_argument("--max-loops", type=int, default=12, help="Loop cap for /effort auto.")
     parser.add_argument("--halt-threshold", type=float, default=0.1, help="/effort auto stops a row when its relative state change drops below this.")
+    parser.add_argument("--best-of", type=int, default=1, help="Sample N stories and show the one the verifier scores highest (needs a sampling temperature).")
     args = parser.parse_args()
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -101,8 +105,9 @@ def main() -> None:
             ids = ids[-input_limit:]
         input_ids = torch.tensor([ids], device=device)
         auto = effort == "auto"
+        candidates = max(1, args.best_of if temperature > 0 else 1)
         output = model.generate(
-            input_ids,
+            input_ids.repeat(candidates, 1),
             thinking_effort=None if auto else effort,
             num_loops=args.max_loops if auto else None,
             halt_threshold=args.halt_threshold if auto else None,
@@ -114,8 +119,15 @@ def main() -> None:
             use_cache=not args.no_kv_cache,
             kv_bits=args.kv_bits,
         )
-        answer = tokenizer.decode(output[0, 1:], skip_special_tokens=True).strip()
-        decoding = "greedy" if temperature == 0 else f"T={temperature:g} top_p={args.top_p:g}"
+        texts = [tokenizer.decode(row[1:], skip_special_tokens=True).strip() for row in output]
+        chosen, verdict = 0, ""
+        if candidates > 1:  # verifier picks: required words from "Use the words: a, b, c", dialogue if requested
+            words = re.search(r"[Uu]se the words?:\s*([^.\n]+)", user)
+            example = {"required_words": [w.strip().lower() for w in words.group(1).split(",")] if words else [], "needs_dialogue": "dialogue" in user.lower()}
+            best, reward = best_candidate(texts, [tokenizer.eos_token_id in row[1:].tolist() for row in output], example, min_reward=-1.0)
+            chosen, verdict = best, f", best of {candidates} (verifier reward {reward:.2f})"
+        answer = texts[chosen]
+        decoding = ("greedy" if temperature == 0 else f"T={temperature:g} top_p={args.top_p:g}") + verdict
         loops = f"{int(model.loops_used[0])} loops used, cap {args.max_loops}" if auto else f"{model.resolve_loops(effort)} loops"
         print(f"{answer_label} ({effort}, {loops}, {decoding}): {answer}")
 

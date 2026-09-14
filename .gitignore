@@ -20,3 +20,6 @@ logs/
 
 # Model files never belong in git
 *.pt
+
+# Derived training data (rejection-sampling output)
+data/

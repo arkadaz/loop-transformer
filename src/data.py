@@ -1,9 +1,11 @@
 """SFT data sources: TinyStoriesInstruct story prompts with a rule verifier, continuation replay, and small QA sets."""
 from __future__ import annotations
 
+import json
 import random
 import re
 from collections import Counter
+from pathlib import Path
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -220,6 +222,12 @@ def load_examples(
     examples: list[Example] = []
     failures: list[str] = []
     for offset, name in enumerate(source_names):
+        if name.startswith("jsonl:"):  # local examples, e.g. rejection-sampling output from src.rft
+            rows = [row for row in (json.loads(line) for line in Path(name[6:]).read_text(encoding="utf-8").splitlines() if line.strip()) if row.get("target")]
+            random.Random(seed + offset).shuffle(rows)
+            examples.extend(rows[:per_source])
+            print(f"Loaded {min(len(rows), per_source)} examples from {name[6:]}.")
+            continue
         if name not in SOURCES:
             raise ValueError(f"Unknown dataset source {name!r}. Choose from {', '.join(SOURCES)}.")
         source = SOURCES[name]

@@ -63,6 +63,11 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 - Added `--loop-range LO HI` (random loop count per training step) and per-row convergence halting (`halt_threshold`, `/effort auto`). A foundation pass with loops in 1..8 gives identical held-out loss at every depth (1.500, vs 1.538 best for the fixed model) and a fixed point after one loop. SFT on it (`story-sft-depth-01`) is flat from 1 to 8 loops (0.44 to 0.46) and stops itself at 2 loops at no cost. Conclusion: robustness and self-stopping, not more intelligence, on this task.
 - `play.py` defaults to `medium` (3 loops).
 
+### Rejection-sampling fine-tuning (expert iteration)
+
+- `src/rft.py` samples N stories per training prompt and keeps the verifier-passing best (every required word, dialogue when asked, EOS, <= 8% repeated 4-grams); `load_examples` accepts `jsonl:<path>` sources; `sft` accepts post-training checkpoints so rounds can iterate. `play.py --best-of N` picks the verifier's favourite at inference.
+- Rounds from `story-sft-depth-01` (reward 0.459 at 4 loops, 4/128 all-three-words): round 1 kept 861 samples -> 0.511 / 10; round 2 kept 1,263 -> 0.580 / 13; round 3 kept 1,759 -> 0.605 / 21 (0.600 with self-stopping at 2 loops). Self-stopping (2 loops) tracks the same gains. The largest improvement of the project.
+
 ### Documentation
 
 - README: quick start, repository layout, every stage's command, the foundation panel, the 128-prompt reward and variety table, the KV cache and TurboQuant tables, and the tried-and-rejected list. This file records the history. `src/instruct_eval.py` and `src/kv_bench.py` reproduce every table.
@@ -75,4 +80,5 @@ Cost of the session: about 250 file-change batches, 82 test-suite runs (5 to 133
 | `loop-transformer-10m-story-sft-05.pt` | SFT, the checkpoint to build on |
 | `loop-transformer-10m-story-evolved-03.pt` | SFT plus evolved latent offset, the one to play with (use `/effort medium`) |
 | `loop-transformer-10m-tinystories-depth-01.pt`, `loop-transformer-10m-story-sft-depth-01.pt` | variable-depth base and its SFT; the ones that can stop themselves (`/effort auto`) |
+| `loop-transformer-10m-story-sft-depth-rft1/2/3.pt` | rejection-sampling rounds on the variable-depth line; **rft3 is the final model** (reward 0.605, self-stopping at 2 loops) |
 | `prefill-01`, `long-01`, `story-sft-04`, `story-sft-06`, `story-evolved-01` | comparison points in the README tables |

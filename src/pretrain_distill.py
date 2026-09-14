@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import math
 import random
 import time
@@ -741,7 +742,7 @@ def _sft_foundation_guard(checkpoint, model, tokenizer, device, batch_size, limi
 def run(args) -> None:
     seed_everything(args.seed)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model, tokenizer = load_checkpoint(args.init_checkpoint, device, expected_stage=("pretrain", "anneal"))
+    model, tokenizer = load_checkpoint(args.init_checkpoint, device, expected_stage=("pretrain", "anneal", "posttrain"))  # posttrain: iterated rounds
     if args.allow_ungated:
         print("WARNING: --allow-ungated skips the foundation quality gate; this base has not passed its rollout screen.")
     else:
@@ -750,6 +751,13 @@ def run(args) -> None:
         checkpoint_metadata(args.init_checkpoint), model, tokenizer, device, args.batch_size,
         limit_override=args.max_foundation_regression,
     )
+    if args.selection == "last":  # RFT rounds: the verifier reward, not the LM loss on self-samples, is the objective
+        guard, order = foundation_selector, itertools.count(1)
+
+        def foundation_selector(current_model, validation_loss):
+            accepted, _, info = guard(current_model, validation_loss)
+            return accepted, -float(next(order)), info  # every guarded epoch counts as an improvement
+
     ensure_teacher_access()
     source_names = tuple(name.strip() for name in args.datasets.split(",") if name.strip())
     print(f"Loading up to {args.per_source} examples from: {', '.join(source_names)}")
@@ -829,6 +837,7 @@ def main() -> None:
     parser.add_argument("--max-foundation-regression", type=float, help="Override the stored foundation-loss regression limit.")
     parser.add_argument("--thinking-effort", choices=("low", "medium", "high"), default="high", help="Encoder loops used in SFT; keep the foundation setting.")
     parser.add_argument("--loop-range", type=int, nargs=2, metavar=("LO", "HI"), help="Random encoder loop count per step in [LO, HI]; makes representations depth-consistent.")
+    parser.add_argument("--selection", choices=("validation", "last"), default="validation", help="Keep the epoch with the best validation loss, or the last epoch that passes the retention guard (RFT rounds).")
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     args = parser.parse_args()
