@@ -365,14 +365,11 @@ def test_wiki40b_document_cleaning_removes_corpus_markup_but_keeps_text():
     assert _clean_document(raw, dataset="google/wiki40b") == "Ada Lovelace\nLife\nShe wrote notes."
 
 
-def test_curated_primary_mixture_has_the_requested_50_30_sources():
-    sources = load_mixture_config("configs/primary_fineweb_wiki40b.json")
-    assert [(source["dataset"], source["config"], source["weight"]) for source in sources] == [
-        ("HuggingFaceTB/smollm-corpus", "fineweb-edu-dedup", 50.0),
-        ("google/wiki40b", "en", 30.0),
-    ]
-    assert sources[0]["use_fallback_validation"]
-    assert sources[1]["validation_split"] == "validation"
+def test_foundation_mixture_config_is_the_pinned_tinystories_source():
+    (source,) = load_mixture_config("configs/tinystories_foundation.json")
+    assert (source["dataset"], source["config"], source["weight"]) == ("roneneldan/TinyStories", "default", 100.0)
+    assert source["validation_split"] == "validation" and not source["use_fallback_validation"]
+    assert source["revision"]
 
 
 def test_primary_mixture_allocates_and_interleaves_weighted_windows_deterministically(monkeypatch):
